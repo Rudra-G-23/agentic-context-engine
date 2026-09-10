@@ -158,6 +158,8 @@ All three share the same constructor pattern: `__init__(self, model: str, *, pro
 
 `RRStep` is both a `StepProtocol[ACEStepContext]` (composable in any pipeline) and `ReflectorLike` (usable as a drop-in reflector). It is a subclass of `RecursiveAgent` with `execute_code` and `recurse` tools, plus two-tier compaction and depth-based recursion. See [RR_DESIGN.md](RR_DESIGN.md) for the full Recursive Reflector architecture.
 
+Recursion runs each child in isolated state: `AgenticDeps.for_child()` builds a fresh deps container (own sandbox, reset iteration and usage), `commit_child()` merges a successful child's mutations back into the parent, and a child that raises leaves parent state untouched.
+
 ---
 
 ## Steps

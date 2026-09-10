@@ -13,14 +13,14 @@ Generic tools (``execute_code``, ``recurse``) are provided by
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional, cast
 
 from pydantic_ai import RunContext
 
 from ace.core.insight_source import InsightSource
 from ace.core.recursive_agent import AgenticDeps
-from ace.core.skillbook import Skillbook, UpdateOperation
+from ace.core.skillbook import Skillbook, UpdateBatch, UpdateOperation
 
 if TYPE_CHECKING:
     from pydantic_ai import Agent as PydanticAgent
@@ -38,6 +38,79 @@ class SMDeps(AgenticDeps):
     skillbook: Optional[Skillbook] = None
     operations: list[UpdateOperation] = field(default_factory=list)
     current_source: Optional[InsightSource] = None
+
+    def for_child(self, *, sandbox: Any) -> "SMDeps":
+        child = cast(SMDeps, super().for_child(sandbox=sandbox))
+
+        if self.skillbook is not None:
+            child.skillbook = self.skillbook.__class__.loads(self.skillbook.dumps())
+
+        child.operations = []
+        return child
+
+    def commit_child(self, child: AgenticDeps) -> None:
+        child = cast(SMDeps, child)
+
+        if self.skillbook is None or child.skillbook is None:
+            return
+
+        staged_skillbook = self.skillbook.__class__.loads(self.skillbook.dumps())
+
+        id_map: dict[str, str] = {}
+        committed_operations: list[UpdateOperation] = []
+        apply_operations: list[UpdateOperation] = []
+
+        for operation in child.operations:
+            skill_id = operation.skill_id
+
+            if skill_id is not None:
+                skill_id = id_map.get(skill_id, skill_id)
+
+            if operation.type == "ADD":
+                child_skill_id = operation.skill_id
+
+                skill = staged_skillbook.add_skill(
+                    section=operation.section,
+                    issue=operation.issue,
+                    keywords=operation.keywords,
+                    insight=operation.insight,
+                    insight_source=operation.insight_source,
+                )
+
+                if child_skill_id is not None:
+                    id_map[child_skill_id] = skill.id
+
+                committed_operation = replace(
+                    operation,
+                    skill_id=skill.id,
+                )
+                committed_operations.append(committed_operation)
+
+                apply_operations.append(replace(committed_operation, skill_id=None))
+                continue
+
+            committed_operation = replace(
+                operation,
+                skill_id=skill_id,
+            )
+
+            staged_skillbook.apply_update(
+                UpdateBatch(
+                    reasoning="",
+                    operations=[committed_operation],
+                )
+            )
+
+            committed_operations.append(committed_operation)
+            apply_operations.append(committed_operation)
+
+        self.skillbook.apply_update(
+            UpdateBatch(
+                reasoning="",
+                operations=apply_operations,
+            )
+        )
+        self.operations.extend(committed_operations)
 
 
 def _normalize_keywords(keywords: Iterable[str]) -> list[str]:

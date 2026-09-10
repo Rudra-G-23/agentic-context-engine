@@ -31,7 +31,7 @@ import concurrent.futures
 import copy
 import logging
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Awaitable, Callable, Sequence, Type
 
 from pydantic_ai import Agent as PydanticAgent
@@ -220,18 +220,7 @@ def register_recurse(agent: PydanticAgent[AgenticDeps, Any]) -> None:
         child_token_budget = max(10_000, int(remaining * cfg.child_budget_fraction))
 
         # Build child deps (same type as parent)
-        child_deps = deps.__class__(
-            **{
-                **{
-                    f.name: getattr(deps, f.name)
-                    for f in deps.__dataclass_fields__.values()
-                },
-                "sandbox": child_sandbox,
-                "depth": deps.depth + 1,
-                "iteration": 0,
-                "parent_usage_tokens": 0,
-            }
-        )
+        child_deps = deps.for_child(sandbox=child_sandbox)
 
         try:
             output, _ = await deps.run_session_fn(
@@ -239,6 +228,8 @@ def register_recurse(agent: PydanticAgent[AgenticDeps, Any]) -> None:
                 prompt=prompt,
                 depth=deps.depth + 1,
             )
+
+            deps.commit_child(child_deps)
 
             # Serialize child output to text
             if hasattr(output, "model_dump"):
@@ -319,6 +310,19 @@ class AgenticDeps:
     iteration: int = 0
     run_session_fn: Callable[..., Awaitable[tuple[Any, Any]]] | None = None
     parent_usage_tokens: int = 0
+
+    def for_child(self, *, sandbox: Any) -> "AgenticDeps":
+        """Create dependency state for an isolated child session."""
+        return replace(
+            self,
+            sandbox=sandbox,
+            depth=self.depth + 1,
+            iteration=0,
+            parent_usage_tokens=0,
+        )
+
+    def commit_child(self, child: "AgenticDeps") -> None:
+        """Commit state from a successful child session."""
 
 
 # ------------------------------------------------------------------

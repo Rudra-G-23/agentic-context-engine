@@ -3,6 +3,7 @@
 Tests sandbox behavior and the PydanticAI-based RRStep entry points.
 """
 
+import asyncio
 import copy
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -391,6 +392,257 @@ class TestRecurseToolRegistration:
         agent = ra._create_agent(depth=0)
         tool_names = list(agent._function_toolset.tools.keys())
         assert "recurse" not in tool_names
+
+
+@pytest.mark.unit
+class TestRecurseStateIsolation:
+    def test_failed_child_does_not_leak_mutations(self):
+        from ace.core.recursive_agent import AgenticConfig, register_recurse
+        from ace.core.skillbook import UpdateOperation
+        from ace.implementations.sm_tools import SMDeps
+
+        class _ToolCapture:
+            def __init__(self):
+                self.tools = {}
+
+            def tool(self, fn=None, **_):
+                if fn is None:
+
+                    def decorator(func):
+                        self.tools[func.__name__] = func
+                        return func
+
+                    return decorator
+
+                self.tools[fn.__name__] = fn
+                return fn
+
+        capture = _ToolCapture()
+        register_recurse(capture)
+
+        skillbook = Skillbook()
+        parent = SMDeps(
+            config=AgenticConfig(),
+            sandbox=TraceSandbox(trace=None),
+            skillbook=skillbook,
+        )
+
+        async def failing_child(*, deps, prompt, depth):
+            skill = deps.skillbook.add_skill(
+                section="strategy",
+                issue="should-not-leak",
+                keywords=["child"],
+                insight="mutation from failed child",
+            )
+
+            deps.operations.append(
+                UpdateOperation(
+                    type="ADD",
+                    section=skill.section,
+                    issue=skill.issue,
+                    keywords=skill.keywords,
+                    insight=skill.insight,
+                    skill_id=skill.id,
+                )
+            )
+
+            raise RuntimeError("simulated child failure")
+
+        parent.run_session_fn = failing_child
+
+        ctx = MagicMock()
+        ctx.deps = parent
+
+        result = asyncio.run(
+            capture.tools["recurse"](
+                ctx,
+                "run failing child",
+            )
+        )
+
+        assert "child session failed" in result
+        assert not any(skill.issue == "should-not-leak" for skill in skillbook.skills())
+        assert parent.operations == []
+
+    def test_parallel_children_have_isolated_state(self):
+        from ace.core.recursive_agent import AgenticConfig, register_recurse
+        from ace.core.skillbook import UpdateOperation
+        from ace.implementations.sm_tools import SMDeps
+
+        class _ToolCapture:
+            def __init__(self):
+                self.tools = {}
+
+            def tool(self, fn=None, **_):
+                if fn is None:
+
+                    def decorator(func):
+                        self.tools[func.__name__] = func
+                        return func
+
+                    return decorator
+
+                self.tools[fn.__name__] = fn
+                return fn
+
+        capture = _ToolCapture()
+        register_recurse(capture)
+
+        parent = SMDeps(
+            config=AgenticConfig(),
+            sandbox=TraceSandbox(trace=None),
+            skillbook=Skillbook(),
+        )
+
+        children = {}
+
+        async def run_child(*, deps, prompt, depth):
+            children[prompt] = deps
+
+            skill = deps.skillbook.add_skill(
+                section="strategy",
+                issue=prompt,
+                keywords=["child"],
+                insight=f"mutation from {prompt}",
+            )
+
+            deps.operations.append(
+                UpdateOperation(
+                    type="ADD",
+                    section=skill.section,
+                    issue=skill.issue,
+                    keywords=skill.keywords,
+                    insight=skill.insight,
+                    skill_id=skill.id,
+                )
+            )
+
+            await asyncio.sleep(0)
+            return prompt, None
+
+        parent.run_session_fn = run_child
+
+        ctx = MagicMock()
+        ctx.deps = parent
+
+        async def run_children():
+            return await asyncio.gather(
+                capture.tools["recurse"](ctx, "child-a"),
+                capture.tools["recurse"](ctx, "child-b"),
+            )
+
+        asyncio.run(run_children())
+
+        child_a = children["child-a"]
+        child_b = children["child-b"]
+
+        assert child_a.skillbook is not parent.skillbook
+        assert child_b.skillbook is not parent.skillbook
+        assert child_a.skillbook is not child_b.skillbook
+
+        assert child_a.operations is not parent.operations
+        assert child_b.operations is not parent.operations
+        assert child_a.operations is not child_b.operations
+
+        parent_issues = {skill.issue for skill in parent.skillbook.skills()}
+
+        assert parent_issues == {"child-a", "child-b"}
+        assert len(parent.operations) == 2
+
+    def test_commit_child_remaps_followup_update(self):
+        from ace.core.recursive_agent import AgenticConfig
+        from ace.core.skillbook import UpdateOperation
+        from ace.implementations.sm_tools import SMDeps
+
+        parent = SMDeps(
+            config=AgenticConfig(),
+            skillbook=Skillbook(),
+        )
+        child = parent.for_child(sandbox=TraceSandbox(trace=None))
+
+        skill = child.skillbook.add_skill(
+            section="strategy",
+            issue="before",
+            keywords=["child"],
+            insight="before insight",
+        )
+        child.operations.append(
+            UpdateOperation(
+                type="ADD",
+                section=skill.section,
+                issue=skill.issue,
+                keywords=skill.keywords,
+                insight=skill.insight,
+                skill_id=skill.id,
+            )
+        )
+
+        child.skillbook.update_skill(
+            skill.id,
+            issue="after",
+            keywords=["child"],
+            insight="after insight",
+        )
+        child.operations.append(
+            UpdateOperation(
+                type="UPDATE",
+                section=skill.section,
+                issue="after",
+                keywords=["child"],
+                insight="after insight",
+                skill_id=skill.id,
+            )
+        )
+
+        parent.commit_child(child)
+
+        committed = parent.skillbook.skills()
+
+        assert len(committed) == 1
+        assert committed[0].issue == "after"
+        assert committed[0].insight == "after insight"
+
+        assert len(parent.operations) == 2
+        assert parent.operations[0].skill_id == committed[0].id
+        assert parent.operations[1].skill_id == committed[0].id
+
+    def test_commit_child_failure_leaves_parent_unchanged(self):
+        from ace.core.recursive_agent import AgenticConfig
+        from ace.core.skillbook import UpdateOperation
+        from ace.implementations.sm_tools import SMDeps
+
+        parent = SMDeps(
+            config=AgenticConfig(),
+            skillbook=Skillbook(),
+        )
+        child = parent.for_child(sandbox=TraceSandbox(trace=None))
+
+        child.operations.extend(
+            [
+                UpdateOperation(
+                    type="ADD",
+                    section="context",
+                    issue="temporary",
+                    keywords=["child"],
+                    insight="valid insight",
+                    skill_id="context-00001",
+                ),
+                UpdateOperation(
+                    type="UPDATE",
+                    section="context",
+                    issue="invalid update",
+                    keywords=["child"],
+                    insight="",
+                    skill_id="context-00001",
+                ),
+            ]
+        )
+
+        with pytest.raises(ValueError):
+            parent.commit_child(child)
+
+        assert parent.skillbook.skills() == []
+        assert parent.operations == []
 
 
 @pytest.mark.unit
