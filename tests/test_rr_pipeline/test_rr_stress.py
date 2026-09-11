@@ -6,6 +6,7 @@ Tests sandbox behavior and the PydanticAI-based RRStep entry points.
 import asyncio
 import copy
 import json
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -643,6 +644,252 @@ class TestRecurseStateIsolation:
 
         assert parent.skillbook.skills() == []
         assert parent.operations == []
+
+    def test_for_child_preserves_computed_embeddings(self):
+        from ace.core.recursive_agent import AgenticConfig
+        from ace.implementations.sm_tools import SMDeps
+
+        parent = SMDeps(config=AgenticConfig(), skillbook=Skillbook())
+        skill = parent.skillbook.add_skill(
+            section="context", issue="issue", keywords=["k"], insight="insight"
+        )
+        skill.embedding = [0.1, 0.2, 0.3]
+
+        child = parent.for_child(sandbox=TraceSandbox(trace=None))
+
+        child_skill = child.skillbook.get_skill(skill.id)
+        assert child_skill is not None
+        assert child_skill.embedding == [0.1, 0.2, 0.3]
+
+        child_skill.embedding[0] = 999.0
+        assert parent.skillbook.get_skill(skill.id).embedding == [0.1, 0.2, 0.3]
+
+    def test_commit_child_remaps_temp_id_when_it_diverges_from_committed_id(self):
+        from ace.core.recursive_agent import AgenticConfig
+        from ace.core.skillbook import UpdateOperation
+        from ace.implementations.sm_tools import SMDeps
+
+        parent = SMDeps(config=AgenticConfig(), skillbook=Skillbook())
+
+        child_a = parent.for_child(sandbox=TraceSandbox(trace=None))
+        skill_a = child_a.skillbook.add_skill(
+            section="context", issue="first", keywords=["c"], insight="first insight"
+        )
+        child_a.operations.append(
+            UpdateOperation(
+                type="ADD",
+                section=skill_a.section,
+                issue=skill_a.issue,
+                keywords=skill_a.keywords,
+                insight=skill_a.insight,
+                skill_id=skill_a.id,
+            )
+        )
+
+        child_b = parent.for_child(sandbox=TraceSandbox(trace=None))
+        skill_b = child_b.skillbook.add_skill(
+            section="context", issue="second", keywords=["c"], insight="second insight"
+        )
+        child_b.operations.append(
+            UpdateOperation(
+                type="ADD",
+                section=skill_b.section,
+                issue=skill_b.issue,
+                keywords=skill_b.keywords,
+                insight=skill_b.insight,
+                skill_id=skill_b.id,
+            )
+        )
+
+        assert skill_a.id == skill_b.id
+
+        id_map_a = parent.commit_child(child_a)
+        id_map_b = parent.commit_child(child_b)
+
+        committed_id_a = id_map_a[skill_a.id]
+        committed_id_b = id_map_b[skill_b.id]
+
+        assert committed_id_b != skill_b.id
+        assert committed_id_a != committed_id_b
+
+        committed_b_skill = parent.skillbook.get_skill(committed_id_b)
+        assert committed_b_skill is not None
+        assert committed_b_skill.issue == "second"
+
+    def test_recurse_rewrites_committed_id_in_returned_text(self):
+        from ace.core.recursive_agent import AgenticConfig, register_recurse
+        from ace.core.skillbook import UpdateOperation
+        from ace.implementations.sm_tools import SMDeps
+
+        class _ToolCapture:
+            def __init__(self):
+                self.tools = {}
+
+            def tool(self, fn=None, **_):
+                if fn is None:
+
+                    def decorator(func):
+                        self.tools[func.__name__] = func
+                        return func
+
+                    return decorator
+
+                self.tools[fn.__name__] = fn
+                return fn
+
+        capture = _ToolCapture()
+        register_recurse(capture)
+
+        parent = SMDeps(
+            config=AgenticConfig(),
+            sandbox=TraceSandbox(trace=None),
+            skillbook=Skillbook(),
+        )
+
+        async def run_child(*, deps, prompt, depth):
+            parent.skillbook.add_skill(
+                section="context",
+                issue="sibling",
+                keywords=["s"],
+                insight="sibling insight",
+            )
+
+            skill = deps.skillbook.add_skill(
+                section="context",
+                issue="child issue",
+                keywords=["c"],
+                insight="child insight",
+            )
+            deps.operations.append(
+                UpdateOperation(
+                    type="ADD",
+                    section=skill.section,
+                    issue=skill.issue,
+                    keywords=skill.keywords,
+                    insight=skill.insight,
+                    skill_id=skill.id,
+                )
+            )
+            return f"Added skill {skill.id} for the sub-task.", deps
+
+        parent.run_session_fn = run_child
+
+        ctx = MagicMock()
+        ctx.deps = parent
+
+        result = asyncio.run(capture.tools["recurse"](ctx, "investigate"))
+
+        new_skill = next(
+            s for s in parent.skillbook.skills() if s.issue == "child issue"
+        )
+
+        assert new_skill.id in result
+        assert new_skill.id != "context-00001"
+        assert "context-00001" not in result
+
+    def test_recurse_id_remap_does_not_cascade(self):
+        from ace.core.recursive_agent import AgenticConfig, register_recurse
+        from ace.implementations.sm_tools import SMDeps
+
+        class _ToolCapture:
+            def __init__(self):
+                self.tools = {}
+
+            def tool(self, fn=None, **_):
+                if fn is None:
+
+                    def decorator(func):
+                        self.tools[func.__name__] = func
+                        return func
+
+                    return decorator
+
+                self.tools[fn.__name__] = fn
+                return fn
+
+        capture = _ToolCapture()
+        register_recurse(capture)
+
+        parent = SMDeps(
+            config=AgenticConfig(),
+            sandbox=TraceSandbox(trace=None),
+            skillbook=Skillbook(),
+        )
+
+        async def run_child(*, deps, prompt, depth):
+            return "Added skill context-00001 for the sub-task.", deps
+
+        parent.run_session_fn = run_child
+        parent.commit_child = MagicMock(
+            return_value={
+                "context-00001": "context-00002",
+                "context-00002": "context-00003",
+            }
+        )
+
+        ctx = MagicMock()
+        ctx.deps = parent
+
+        result = asyncio.run(capture.tools["recurse"](ctx, "investigate"))
+
+        assert "context-00002" in result
+        assert "context-00003" not in result
+
+    def test_concurrent_commit_child_serializes_id_assignment(self):
+        from ace.core.recursive_agent import AgenticConfig
+        from ace.core.skillbook import UpdateOperation
+        from ace.implementations.sm_tools import SMDeps
+
+        parent = SMDeps(config=AgenticConfig(), skillbook=Skillbook())
+        n_children = 16
+        errors: list[Exception] = []
+        results: dict[int, str] = {}
+        results_lock = threading.Lock()
+
+        def run_one(i: int) -> None:
+            try:
+                child = parent.for_child(sandbox=TraceSandbox(trace=None))
+                skill = child.skillbook.add_skill(
+                    section="context",
+                    issue=f"issue-{i}",
+                    keywords=["c"],
+                    insight=f"insight-{i}",
+                )
+                child.operations.append(
+                    UpdateOperation(
+                        type="ADD",
+                        section=skill.section,
+                        issue=skill.issue,
+                        keywords=skill.keywords,
+                        insight=skill.insight,
+                        skill_id=skill.id,
+                    )
+                )
+                id_map = parent.commit_child(child)
+                with results_lock:
+                    results[i] = id_map[skill.id]
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=run_one, args=(i,)) for i in range(n_children)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == [], f"Concurrent commit errors: {errors}"
+
+        committed_ids = list(results.values())
+        assert len(committed_ids) == n_children
+        assert len(set(committed_ids)) == n_children
+
+        assert len(parent.skillbook.skills()) == n_children
+        for i, committed_id in results.items():
+            skill = parent.skillbook.get_skill(committed_id)
+            assert skill is not None
+            assert skill.issue == f"issue-{i}"
 
 
 @pytest.mark.unit
